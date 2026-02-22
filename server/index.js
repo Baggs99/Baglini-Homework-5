@@ -472,7 +472,7 @@ app.post('/api/tts', async (req, res) => {
 
 const indexHtml = path.join(__dirname, '..', 'build', 'index.html');
 if (fs.existsSync(indexHtml)) {
-  app.get('*', (req, res) => res.sendFile(indexHtml));
+  app.get(/^(?!\/api).*/, (req, res) => res.sendFile(indexHtml));
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

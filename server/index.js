@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env'), override: true });
 require('dotenv').config({ path: path.join(__dirname, '.env'), override: true });
 
@@ -37,12 +38,12 @@ async function connect() {
   console.log('MongoDB connected');
 }
 
-app.get('/', (req, res) => {
-  res.send(`<html><body style="font-family:sans-serif;padding:2rem;background:#00356b;color:white;min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0">
-    <div style="text-align:center"><h1>YouTube AI Chat API</h1>
-    <p>Backend running. React app at <a href="http://localhost:3000" style="color:#ffd700">localhost:3000</a></p>
-    <p><a href="/api/health" style="color:#ffd700">Health</a></p></div></body></html>`);
-});
+// In production, serve the React build
+const buildPath = path.join(__dirname, '..', 'build');
+if (fs.existsSync(buildPath)) {
+  app.use(express.static(buildPath));
+  console.log('[Static] Serving React build from', buildPath);
+}
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
@@ -466,6 +467,13 @@ app.post('/api/tts', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── SPA catch-all (must be last route) ────────────────────────────────────────
+
+const indexHtml = path.join(__dirname, '..', 'build', 'index.html');
+if (fs.existsSync(indexHtml)) {
+  app.get('*', (req, res) => res.sendFile(indexHtml));
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 

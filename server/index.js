@@ -1,16 +1,34 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '..', '.env'), override: true });
+require('dotenv').config({ path: path.join(__dirname, '.env'), override: true });
+
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
+const { streamChatInternal, chatWithToolsInternal } = require('./geminiProxy');
+const { getGeminiModelName } = require('./geminiConfig');
+const {
+  resolveChannelId,
+  getUploadsPlaylist,
+  listVideoIds,
+  getVideoDetails,
+  getTranscript,
+  isYtDlpAvailable,
+} = require('./youtubeService');
 
 const app = express();
-app.use(cors());
+
+const allowedOrigins = ['http://localhost:3000', process.env.CORS_ORIGIN].filter(Boolean);
+app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : true }));
 app.use(express.json({ limit: '10mb' }));
 
-const URI = process.env.REACT_APP_MONGODB_URI || process.env.MONGODB_URI || process.env.REACT_APP_MONGO_URI;
+const URI =
+  process.env.MONGO_URI ||
+  process.env.MONGODB_URI ||
+  process.env.REACT_APP_MONGODB_URI ||
+  process.env.REACT_APP_MONGO_URI;
 const DB = 'chatapp';
-
 let db;
 
 async function connect() {
@@ -20,17 +38,35 @@ async function connect() {
 }
 
 app.get('/', (req, res) => {
-  res.send(`
-    <html>
-      <body style="font-family:sans-serif;padding:2rem;background:#00356b;color:white;min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0">
-        <div style="text-align:center">
-          <h1>Chat API Server</h1>
-          <p>Backend is running. Use the React app at <a href="http://localhost:3000" style="color:#ffd700">localhost:3000</a></p>
-          <p><a href="/api/status" style="color:#ffd700">Check DB status</a></p>
-        </div>
-      </body>
-    </html>
-  `);
+  res.send(`<html><body style="font-family:sans-serif;padding:2rem;background:#00356b;color:white;min-height:100vh;display:flex;align-items:center;justify-content:center;margin:0">
+    <div style="text-align:center"><h1>YouTube AI Chat API</h1>
+    <p>Backend running. React app at <a href="http://localhost:3000" style="color:#ffd700">localhost:3000</a></p>
+    <p><a href="/api/health" style="color:#ffd700">Health</a></p></div></body></html>`);
+});
+
+// ── Health ────────────────────────────────────────────────────────────────────
+app.get('/api/health', async (req, res) => {
+  let mongoConnected = false;
+  try {
+    if (db) {
+      await db.command({ ping: 1 });
+      mongoConnected = true;
+    }
+  } catch { /* not connected */ }
+
+  res.json({
+    ok: true,
+    mongoConnected,
+    youtubeKeyConfigured: !!process.env.YOUTUBE_API_KEY,
+    ytDlpAvailable: isYtDlpAvailable(),
+    env: {
+      GEMINI_API_KEY: !!process.env.GEMINI_API_KEY,
+      OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
+      YOUTUBE_API_KEY: !!process.env.YOUTUBE_API_KEY,
+      ELEVENLABS_API_KEY: !!process.env.ELEVENLABS_API_KEY,
+      MONGO_URI: !!URI,
+    },
+  });
 });
 
 app.get('/api/status', async (req, res) => {
@@ -43,11 +79,38 @@ app.get('/api/status', async (req, res) => {
   }
 });
 
-// ── Users ────────────────────────────────────────────────────────────────────
+// ── Transcript test (dev helper) ─────────────────────────────────────────────
+
+app.get('/api/youtube/test-transcript', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ error: 'url query param required (e.g. ?url=https://www.youtube.com/watch?v=094y1Z2wpJg)' });
+
+    const videoId = url.includes('watch?v=')
+      ? new URL(url).searchParams.get('v')
+      : url.replace(/^.*[/=]/, '');
+
+    if (!videoId) return res.status(400).json({ error: 'Could not extract video ID from URL' });
+
+    const result = await getTranscript(videoId);
+    res.json({
+      videoId,
+      transcript_status: result.transcript_status,
+      transcript_error: result.transcript_error,
+      transcript_length: result.transcript?.length || 0,
+      transcript_preview: result.transcript?.slice(0, 500) || null,
+      ytDlpAvailable: isYtDlpAvailable(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Users ─────────────────────────────────────────────────────────────────────
 
 app.post('/api/users', async (req, res) => {
   try {
-    const { username, password, email } = req.body;
+    const { username, password, email, firstName, lastName } = req.body;
     if (!username || !password)
       return res.status(400).json({ error: 'Username and password required' });
     const name = String(username).trim().toLowerCase();
@@ -58,6 +121,8 @@ app.post('/api/users', async (req, res) => {
       username: name,
       password: hashed,
       email: email ? String(email).trim().toLowerCase() : null,
+      firstName: firstName ? String(firstName).trim() : null,
+      lastName: lastName ? String(lastName).trim() : null,
       createdAt: new Date().toISOString(),
     });
     res.json({ ok: true });
@@ -76,23 +141,24 @@ app.post('/api/users/login', async (req, res) => {
     if (!user) return res.status(401).json({ error: 'User not found' });
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) return res.status(401).json({ error: 'Invalid password' });
-    res.json({ ok: true, username: name });
+    res.json({
+      ok: true,
+      username: name,
+      firstName: user.firstName || null,
+      lastName: user.lastName || null,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Sessions ─────────────────────────────────────────────────────────────────
+// ── Sessions ──────────────────────────────────────────────────────────────────
 
 app.get('/api/sessions', async (req, res) => {
   try {
     const { username } = req.query;
     if (!username) return res.status(400).json({ error: 'username required' });
-    const sessions = await db
-      .collection('sessions')
-      .find({ username })
-      .sort({ createdAt: -1 })
-      .toArray();
+    const sessions = await db.collection('sessions').find({ username }).sort({ createdAt: -1 }).toArray();
     res.json(
       sessions.map((s) => ({
         id: s._id.toString(),
@@ -109,9 +175,8 @@ app.get('/api/sessions', async (req, res) => {
 
 app.post('/api/sessions', async (req, res) => {
   try {
-    const { username, agent } = req.body;
+    const { username, agent, title } = req.body;
     if (!username) return res.status(400).json({ error: 'username required' });
-    const { title } = req.body;
     const result = await db.collection('sessions').insertOne({
       username,
       agent: agent || null,
@@ -136,10 +201,9 @@ app.delete('/api/sessions/:id', async (req, res) => {
 
 app.patch('/api/sessions/:id/title', async (req, res) => {
   try {
-    const { title } = req.body;
     await db.collection('sessions').updateOne(
       { _id: new ObjectId(req.params.id) },
-      { $set: { title } }
+      { $set: { title: req.body.title } }
     );
     res.json({ ok: true });
   } catch (err) {
@@ -147,7 +211,7 @@ app.patch('/api/sessions/:id/title', async (req, res) => {
   }
 });
 
-// ── Messages ─────────────────────────────────────────────────────────────────
+// ── Messages ──────────────────────────────────────────────────────────────────
 
 app.post('/api/messages', async (req, res) => {
   try {
@@ -158,9 +222,7 @@ app.post('/api/messages', async (req, res) => {
       role,
       content,
       timestamp: new Date().toISOString(),
-      ...(imageData && {
-        imageData: Array.isArray(imageData) ? imageData : [imageData],
-      }),
+      ...(imageData && { imageData: Array.isArray(imageData) ? imageData : [imageData] }),
       ...(charts?.length && { charts }),
       ...(toolCalls?.length && { toolCalls }),
     };
@@ -178,24 +240,16 @@ app.get('/api/messages', async (req, res) => {
   try {
     const { session_id } = req.query;
     if (!session_id) return res.status(400).json({ error: 'session_id required' });
-    const doc = await db
-      .collection('sessions')
-      .findOne({ _id: new ObjectId(session_id) });
+    const doc = await db.collection('sessions').findOne({ _id: new ObjectId(session_id) });
     const raw = doc?.messages || [];
     const msgs = raw.map((m, i) => {
-      const arr = m.imageData
-        ? Array.isArray(m.imageData)
-          ? m.imageData
-          : [m.imageData]
-        : [];
+      const arr = m.imageData ? (Array.isArray(m.imageData) ? m.imageData : [m.imageData]) : [];
       return {
         id: `${doc._id}-${i}`,
         role: m.role,
         content: m.content,
         timestamp: m.timestamp,
-        images: arr.length
-          ? arr.map((img) => ({ data: img.data, mimeType: img.mimeType }))
-          : undefined,
+        images: arr.length ? arr.map((img) => ({ data: img.data, mimeType: img.mimeType })) : undefined,
         charts: m.charts?.length ? m.charts : undefined,
         toolCalls: m.toolCalls?.length ? m.toolCalls : undefined,
       };
@@ -206,12 +260,230 @@ app.get('/api/messages', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ── AI Proxy Routes ───────────────────────────────────────────────────────────
+
+app.post('/api/gemini/stream', async (req, res) => {
+  try {
+    const { history, message, imageParts, useCodeExecution, userInfo } = req.body;
+    if (!message) return res.status(400).json({ error: 'message required' });
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    for await (const chunk of streamChatInternal(
+      history || [],
+      message,
+      imageParts || [],
+      !!useCodeExecution,
+      userInfo || null
+    )) {
+      res.write(JSON.stringify(chunk) + '\n');
+    }
+    res.end();
+  } catch (err) {
+    console.error('[Gemini stream]', err.message);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+    else res.end();
+  }
+});
+
+app.post('/api/gemini/chat', async (req, res) => {
+  try {
+    const { history, message, channelData, imageParts, userInfo } = req.body;
+    if (!message) return res.status(400).json({ error: 'message required' });
+
+    const result = await chatWithToolsInternal(
+      history || [],
+      message,
+      channelData || [],
+      imageParts || [],
+      userInfo || null
+    );
+    res.json(result);
+  } catch (err) {
+    console.error('[Gemini chat]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── YouTube Channel Download (NDJSON progress stream) ─────────────────────────
+
+app.post('/api/youtube/download', async (req, res) => {
+  try {
+    const { channelUrl, maxVideos = 10 } = req.body;
+    if (!channelUrl) return res.status(400).json({ error: 'channelUrl required' });
+    if (!process.env.YOUTUBE_API_KEY)
+      return res.status(503).json({ error: 'YOUTUBE_API_KEY not configured on server' });
+
+    const max = Math.min(Math.max(1, parseInt(maxVideos) || 10), 100);
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const send = (obj) => res.write(JSON.stringify(obj) + '\n');
+
+    send({ type: 'status', message: 'Resolving channel...' });
+    const channelId = await resolveChannelId(channelUrl);
+
+    send({ type: 'status', message: 'Finding uploads playlist...' });
+    const playlistId = await getUploadsPlaylist(channelId);
+
+    send({ type: 'status', message: `Listing up to ${max} videos...` });
+    const videoIds = await listVideoIds(playlistId, max);
+    const total = videoIds.length;
+    send({ type: 'status', message: `Found ${total} videos. Fetching details...` });
+
+    const details = await getVideoDetails(videoIds);
+
+    const videos = [];
+    for (let i = 0; i < videoIds.length; i++) {
+      const id = videoIds[i];
+      const d = details[id];
+      if (!d) continue;
+
+      send({ type: 'progress', current: i + 1, total, title: d.title });
+
+      let transcript = null;
+      let transcript_status = 'unavailable';
+      let transcript_error = null;
+      try {
+        const result = await getTranscript(id);
+        transcript = result.transcript;
+        transcript_status = result.transcript_status;
+        transcript_error = result.transcript_error;
+      } catch (err) {
+        transcript_status = 'fetch_failed';
+        transcript_error = err.message?.slice(0, 120) || 'unknown';
+      }
+
+      videos.push({
+        video_id: id,
+        title: d.title,
+        description: (d.description || '').slice(0, 500),
+        transcript,
+        transcript_status,
+        transcript_error,
+        duration: d.duration,
+        release_date: d.release_date,
+        view_count: d.view_count,
+        like_count: d.like_count,
+        comment_count: d.comment_count,
+        video_url: `https://www.youtube.com/watch?v=${id}`,
+        thumbnail_url: d.thumbnail_url,
+      });
+    }
+
+    send({ type: 'done', videos });
+    res.end();
+  } catch (err) {
+    console.error('[YouTube download]', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    } else {
+      res.write(JSON.stringify({ type: 'error', message: err.message }) + '\n');
+      res.end();
+    }
+  }
+});
+
+// ── Image generation endpoint ─────────────────────────────────────────────────
+
+app.post('/api/generate-image', async (req, res) => {
+  try {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(503).json({ error: 'OPENAI_API_KEY not configured' });
+
+    const { prompt, anchor_description } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    let fullPrompt = prompt;
+    if (anchor_description) fullPrompt += `\n\nStyle reference: ${anchor_description}`;
+
+    const resp = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: 'dall-e-3',
+        prompt: fullPrompt,
+        n: 1,
+        size: '1024x1024',
+        response_format: 'b64_json',
+      }),
+    });
+
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error?.message || resp.statusText);
+
+    const img = data.data?.[0];
+    res.json({ imageBase64: img.b64_json, mimeType: 'image/png', revised_prompt: img.revised_prompt });
+  } catch (err) {
+    console.error('[GenerateImage]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── OpenAI & TTS (unchanged) ─────────────────────────────────────────────────
+
+app.post('/api/openai', async (req, res) => {
+  try {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(503).json({ error: 'OPENAI_API_KEY not configured' });
+    const { prompt, model = 'gpt-4o-mini' } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }] }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error?.message || resp.statusText);
+    res.json({ text: data.choices?.[0]?.message?.content || '' });
+  } catch (err) {
+    console.error('[OpenAI]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/tts', async (req, res) => {
+  try {
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    if (!apiKey) return res.status(503).json({ error: 'ELEVENLABS_API_KEY not configured' });
+    const { text, voiceId = '21m00Tcm4TlvDq8ikWAM' } = req.body;
+    if (!text) return res.status(400).json({ error: 'text required' });
+    const resp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'xi-api-key': apiKey, Accept: 'audio/mpeg' },
+      body: JSON.stringify({ text }),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    const audioBuffer = await resp.arrayBuffer();
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.send(Buffer.from(audioBuffer));
+  } catch (err) {
+    console.error('[TTS]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3001;
 
+console.log('Env diagnostics:');
+console.log('  GEMINI_API_KEY present?', process.env.GEMINI_API_KEY ? 'yes' : 'no');
+console.log('  OPENAI_API_KEY present?', process.env.OPENAI_API_KEY ? 'yes' : 'no');
+console.log('  YOUTUBE_API_KEY present?', process.env.YOUTUBE_API_KEY ? 'yes' : 'no');
+console.log('  MONGO_URI present?', URI ? 'yes' : 'no');
+
 connect()
-  .then(() => {
+  .then(async () => {
+    if (process.env.GEMINI_API_KEY) {
+      try { await getGeminiModelName(); } catch (err) {
+        console.warn('[Startup] Gemini model init:', err.message);
+      }
+    }
     app.listen(PORT, () => console.log(`Server on http://localhost:${PORT}`));
   })
   .catch((err) => {

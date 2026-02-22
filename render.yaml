@@ -1,9 +1,17 @@
 # Render Blueprint — defines both services in one file.
 # Docs: https://render.com/docs/blueprint-spec
+#
+# Env vars to set in Render dashboard (backend):
+#   GEMINI_API_KEY, OPENAI_API_KEY (optional), ELEVENLABS_API_KEY (optional)
+#   MONGO_URI or MONGODB_URI
+#   CORS_ORIGIN (optional): frontend URL, e.g. https://chatapp-frontend.onrender.com
+#
+# Env vars for frontend:
+#   REACT_APP_API_URL = backend URL, e.g. https://chatapp-backend.onrender.com
 
 services:
 
-  # ── Backend: Express API ────────────────────────────────────────────────────
+  # ── Backend: Express API (owns all secrets) ─────────────────────────────────
   - type: web
     name: chatapp-backend
     env: node
@@ -11,20 +19,28 @@ services:
     buildCommand: npm install
     startCommand: node server/index.js
     envVars:
-      - key: MONGODB_URI
-        sync: false   # set manually in the Render dashboard
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
 
-  # ── Frontend: React static site ────────────────────────────────────────────
+  # ── Frontend: React static site (no secrets) ───────────────────────────────
   - type: static
     name: chatapp-frontend
     plan: free
     buildCommand: npm install && ./node_modules/.bin/react-scripts build
     staticPublishPath: ./build
     envVars:
-      - key: REACT_APP_GEMINI_API_KEY
-        sync: false   # set manually — baked into JS bundle at build time
       - key: REACT_APP_API_URL
-        sync: false   # set to the backend URL, e.g. https://chatapp-backend.onrender.com
+        sync: false   # backend URL, e.g. https://chatapp-backend.onrender.com
     routes:
       - type: rewrite
         source: /*

@@ -119,3 +119,13 @@
 .auth-switch:hover {
   color: rgba(255, 255, 255, 0.85);
 }
+
+.auth-name-row {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.auth-name-row input {
+  flex: 1;
+  min-width: 0;
+}
